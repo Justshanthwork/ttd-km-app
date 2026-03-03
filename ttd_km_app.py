@@ -141,6 +141,17 @@ def extract_unique_drugs(df: pd.DataFrame) -> list:
     return sorted(drugs, key=str.lower)
 
 
+def group_by_drug(km_dataset: pd.DataFrame, selected_drugs: list) -> dict:
+    """Group km_dataset rows by which selected drug(s) match the regimen string."""
+    groups = {}
+    for _, row in km_dataset.iterrows():
+        regimen_str = str(row.get("regimen", "")).lower()
+        matched = [drug for drug in selected_drugs if drug.lower() in regimen_str]
+        label = ", ".join(matched) if matched else "Other"
+        groups.setdefault(label, []).append(row)
+    return {label: pd.DataFrame(rows).reset_index(drop=True) for label, rows in groups.items()}
+
+
 def filter_data(
     df: pd.DataFrame,
     study_start: datetime.date,
@@ -348,20 +359,10 @@ def plot_km_curve(km_dataset: pd.DataFrame, selected_drugs: list) -> plt.Figure:
 
     # If multiple drugs selected, try to plot per regimen group
     if selected_drugs and len(selected_drugs) > 1:
-        # Group by which selected drug matches the regimen
-        groups = {}
-        for _, row in km_dataset.iterrows():
-            regimen_str = str(row.get("regimen", "")).lower()
-            matched = []
-            for drug in selected_drugs:
-                if drug.lower() in regimen_str:
-                    matched.append(drug)
-            label = ", ".join(matched) if matched else "Other"
-            groups.setdefault(label, []).append(row)
+        drug_groups = group_by_drug(km_dataset, selected_drugs)
 
         kmf_list = []
-        for i, (label, rows) in enumerate(sorted(groups.items())):
-            grp = pd.DataFrame(rows)
+        for i, (label, grp) in enumerate(sorted(drug_groups.items())):
             if len(grp) < 2:
                 continue
             kmf = KaplanMeierFitter()
@@ -472,19 +473,35 @@ def get_km_curve_data(km_dataset: pd.DataFrame) -> pd.DataFrame:
     return curve_df
 
 
-def export_to_excel(km_dataset, curve_data, meta_df, summary_df) -> bytes:
-    """Export all outputs to an Excel file with three sheets."""
+def export_to_excel(km_dataset, curve_data, meta_df, summary_df, drug_groups=None) -> bytes:
+    """Export all outputs to an Excel file. Per-drug sheets when drug_groups is provided."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        km_dataset.to_excel(writer, sheet_name="KM_Dataset", index=False)
-        curve_data.to_excel(writer, sheet_name="KM_Curve_Data", index=False)
+        if drug_groups:
+            for label, grp_df in sorted(drug_groups.items()):
+                if len(grp_df) == 0:
+                    continue
+                grp_meta, grp_summary = compute_summary_table(grp_df, label)
+                grp_curve = get_km_curve_data(grp_df)
+                # Excel sheet names max 31 chars; use first 16 chars of label as prefix
+                prefix = label[:16].rstrip()
+                grp_df.to_excel(writer, sheet_name=f"{prefix}_KM_Dataset", index=False)
+                grp_curve.to_excel(writer, sheet_name=f"{prefix}_KM_Curve", index=False)
+                grp_meta.to_excel(writer, sheet_name=f"{prefix}_Summary", index=False, startrow=0)
+                grp_summary.to_excel(
+                    writer, sheet_name=f"{prefix}_Summary", index=False,
+                    startrow=len(grp_meta) + 2,
+                )
+        else:
+            km_dataset.to_excel(writer, sheet_name="KM_Dataset", index=False)
+            curve_data.to_excel(writer, sheet_name="KM_Curve_Data", index=False)
 
-        # Summary sheet: meta info at top, then survival probabilities
-        meta_df.to_excel(writer, sheet_name="Summary_Table", index=False, startrow=0)
-        summary_df.to_excel(
-            writer, sheet_name="Summary_Table", index=False,
-            startrow=len(meta_df) + 2,
-        )
+            # Summary sheet: meta info at top, then survival probabilities
+            meta_df.to_excel(writer, sheet_name="Summary_Table", index=False, startrow=0)
+            summary_df.to_excel(
+                writer, sheet_name="Summary_Table", index=False,
+                startrow=len(meta_df) + 2,
+            )
 
         # ── Format sheets ──
         wb = writer.book
@@ -647,9 +664,11 @@ if run_button and raw_df is not None:
                 # Step 3: Generate KM dataset
                 km_dataset = generate_km_dataset(result_df)
 
-                # Step 4: Summary
+                # Step 4: Summary + drug groups
                 regimen_label = ", ".join(selected_drugs) if selected_drugs else "All Regimens"
                 meta_df, summary_df = compute_summary_table(km_dataset, regimen_label)
+                multi_drug = selected_drugs and len(selected_drugs) > 1
+                drug_groups = group_by_drug(km_dataset, selected_drugs) if multi_drug else None
 
                 # Step 5: Plot
                 fig = plot_km_curve(km_dataset, selected_drugs)
@@ -661,18 +680,34 @@ if run_button and raw_df is not None:
                 st.markdown("---")
                 st.markdown("## 📈 Analysis Results")
 
-                # Metric cards
-                n_total = len(km_dataset)
-                n_events = int(km_dataset["event_flag"].sum())
-                n_censored = n_total - n_events
-                median_val = meta_df["Median TTD (days)"].values[0]
-
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Total Patients (N)", f"{n_total:,}")
-                c2.metric("Events", f"{n_events:,}")
-                c3.metric("Censored", f"{n_censored:,}")
-                c4.metric("Event Rate", f"{n_events/n_total*100:.1f}%")
-                c5.metric("Median TTD", median_val)
+                # Metric cards — per drug when multiple selected, aggregate otherwise
+                if multi_drug and drug_groups:
+                    for group_label, grp_df in sorted(drug_groups.items()):
+                        if len(grp_df) == 0:
+                            continue
+                        grp_meta, _ = compute_summary_table(grp_df, group_label)
+                        grp_n_total = len(grp_df)
+                        grp_n_events = int(grp_df["event_flag"].sum())
+                        grp_n_censored = grp_n_total - grp_n_events
+                        grp_median = grp_meta["Median TTD (days)"].values[0]
+                        st.markdown(f"##### {group_label}")
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        c1.metric("Total Patients (N)", f"{grp_n_total:,}")
+                        c2.metric("Events", f"{grp_n_events:,}")
+                        c3.metric("Censored", f"{grp_n_censored:,}")
+                        c4.metric("Event Rate", f"{grp_n_events/grp_n_total*100:.1f}%")
+                        c5.metric("Median TTD", grp_median)
+                else:
+                    n_total = len(km_dataset)
+                    n_events = int(km_dataset["event_flag"].sum())
+                    n_censored = n_total - n_events
+                    median_val = meta_df["Median TTD (days)"].values[0]
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Total Patients (N)", f"{n_total:,}")
+                    c2.metric("Events", f"{n_events:,}")
+                    c3.metric("Censored", f"{n_censored:,}")
+                    c4.metric("Event Rate", f"{n_events/n_total*100:.1f}%")
+                    c5.metric("Median TTD", median_val)
 
                 # Tabs
                 tab1, tab2, tab3, tab4 = st.tabs([
@@ -687,13 +722,27 @@ if run_button and raw_df is not None:
                     st.caption(f"Showing {len(km_dataset):,} records")
 
                 with tab3:
-                    st.markdown("### Overall Statistics")
-                    st.dataframe(meta_df, use_container_width=True)
-                    st.markdown("### Survival Probabilities at Fixed Months")
-                    st.dataframe(summary_df, use_container_width=True)
+                    if multi_drug and drug_groups:
+                        for group_label, grp_df in sorted(drug_groups.items()):
+                            if len(grp_df) == 0:
+                                continue
+                            grp_meta, grp_summary = compute_summary_table(grp_df, group_label)
+                            st.markdown(f"### {group_label}")
+                            st.markdown("**Overall Statistics**")
+                            st.dataframe(grp_meta, use_container_width=True)
+                            st.markdown("**Survival Probabilities at Fixed Months**")
+                            st.dataframe(grp_summary, use_container_width=True)
+                    else:
+                        st.markdown("### Overall Statistics")
+                        st.dataframe(meta_df, use_container_width=True)
+                        st.markdown("### Survival Probabilities at Fixed Months")
+                        st.dataframe(summary_df, use_container_width=True)
 
                 with tab4:
-                    excel_bytes = export_to_excel(km_dataset, curve_data, meta_df, summary_df)
+                    excel_bytes = export_to_excel(
+                        km_dataset, curve_data, meta_df, summary_df,
+                        drug_groups=drug_groups if multi_drug else None,
+                    )
                     st.download_button(
                         label="📥 Download Excel Report",
                         data=excel_bytes,
@@ -702,7 +751,14 @@ if run_button and raw_df is not None:
                         use_container_width=True,
                         type="primary",
                     )
-                    st.success("Excel file contains 3 sheets: KM_Dataset, KM_Curve_Data, Summary_Table")
+                    if multi_drug and drug_groups:
+                        sheet_names = ", ".join(
+                            f"{label[:16].rstrip()}_KM_Dataset / _KM_Curve / _Summary"
+                            for label in sorted(drug_groups)
+                        )
+                        st.success(f"Excel contains per-drug sheets: {sheet_names}")
+                    else:
+                        st.success("Excel file contains 3 sheets: KM_Dataset, KM_Curve_Data, Summary_Table")
 
 elif run_button and raw_df is None:
     st.warning("⚠️ Please upload a data file first.")
