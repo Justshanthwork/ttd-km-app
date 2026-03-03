@@ -135,7 +135,7 @@ def extract_unique_drugs(df: pd.DataFrame) -> list:
     drugs = set()
     for val in df["regimen"].dropna().unique():
         for drug in str(val).split(","):
-            cleaned = drug.strip()
+            cleaned = drug.strip().split("-")[0].strip()
             if cleaned:
                 drugs.add(cleaned)
     return sorted(drugs, key=str.lower)
